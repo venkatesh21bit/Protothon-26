@@ -14,9 +14,9 @@ services:
       - DATABASE_URL=postgresql+asyncpg://nidaan:nidaan123@postgres:5432/nidaan
       - REDIS_URL=redis://redis:6379
       - JWT_SECRET=dev-secret-change-in-production
-      # Gemini
-      - GEMINI_API_KEY=AIzaSyD3Zu4TB4gSgPBHC8VK0xZLovOVYFOD39I
-      - GEMINI_MODEL=gemini-3-flash-preview
+      # Gemini (set GEMINI_API_KEY in a root .env file — never commit the key)
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3-flash-preview}
       # Local file storage
       - STORAGE_PATH=/app/uploads
       # Email

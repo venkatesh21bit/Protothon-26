@@ -69,18 +69,20 @@ if (Test-Path $envFile) {
     Write-Host "[WARNING] .env file not found. Creating secrets manually..." -ForegroundColor Yellow
     
     # Create secrets individually
+    # Create secrets from environment variables — set these in your shell before running
+    # e.g.: $env:CLOUDANT_API_KEY = "..."
     ibmcloud ce secret create --name nidaan-secrets `
-        --from-literal CLOUDANT_URL="https://01e1127e-8c45-41c4-9495-6755487a914d-bluemix.cloudantnosqldb.appdomain.cloud" `
-        --from-literal CLOUDANT_API_KEY="mN-57wP97ujEMjTuMGI9d0ojRksj-DSPpYWoHQOlw4Py" `
-        --from-literal CLOUDANT_DATABASE_NAME="nidaan_triage" `
-        --from-literal IBM_STT_API_KEY="1rAK9tt3QiboojI6Ebqb1l6_h0zttUrjZtC7OHbu2BtG" `
-        --from-literal IBM_STT_URL="https://api.us-south.speech-to-text.watson.cloud.ibm.com/instances/563687ea-153a-4c51-a0f4-b3c483984e74" `
-        --from-literal IBM_NLU_API_KEY="u-GvYITBy02fnYmh7gJ8gNV51yIqIyHLqDWzBsAP69Qz" `
-        --from-literal IBM_NLU_URL="https://api.us-south.natural-language-understanding.watson.cloud.ibm.com/instances/1fef2934-be73-4593-bfcf-1041451e98a8" `
+        --from-literal CLOUDANT_URL="$env:CLOUDANT_URL" `
+        --from-literal CLOUDANT_API_KEY="$env:CLOUDANT_API_KEY" `
+        --from-literal CLOUDANT_DATABASE_NAME="$env:CLOUDANT_DATABASE_NAME" `
+        --from-literal IBM_STT_API_KEY="$env:IBM_STT_API_KEY" `
+        --from-literal IBM_STT_URL="$env:IBM_STT_URL" `
+        --from-literal IBM_NLU_API_KEY="$env:IBM_NLU_API_KEY" `
+        --from-literal IBM_NLU_URL="$env:IBM_NLU_URL" `
         --from-literal SMTP_SERVER="smtp.gmail.com" `
         --from-literal SMTP_PORT="587" `
-        --from-literal SMTP_EMAIL="venkatesh.k21062005@gmail.com" `
-        --from-literal SMTP_PASSWORD="ywqc fghh kgdv kaqe" `
+        --from-literal SMTP_EMAIL="$env:SMTP_EMAIL" `
+        --from-literal SMTP_PASSWORD="$env:SMTP_PASSWORD" `
         --force
 }
 

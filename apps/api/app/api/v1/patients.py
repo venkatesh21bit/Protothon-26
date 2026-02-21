@@ -1,7 +1,7 @@
 """
 Patient endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from typing import List, Dict, Optional
 from datetime import datetime
 from pydantic import BaseModel
@@ -128,6 +128,8 @@ ABSOLUTE FORBIDDEN RESPONSES — never violate these
 5. NEVER go off-topic (personal chat, non-medical topics, jokes).
    → Gently redirect: "I'm here to collect your health information before your consultation."
 6. NEVER ask more than ONE question per reply.
+7. NEVER ask about information already listed in "INFORMATION ALREADY COLLECTED". Do not re-ask symptoms, duration, or severity if they are already recorded above.
+8. ALWAYS write complete sentences. Never end a sentence abruptly.
 
 ════════════════════════════════════════
 INFORMATION ALREADY COLLECTED THIS SESSION
@@ -183,6 +185,85 @@ async def reset_patient_chat(current_user: Dict = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"Reset error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Reset failed: {str(e)}")
+
+
+# Language code → human-readable name for the Gemini transcription prompt
+_LANG_NAMES = {
+    "ta-IN": "Tamil (தமிழ்)",
+    "hi-IN": "Hindi (हिन्दी)",
+    "te-IN": "Telugu (తెలుగు)",
+    "mr-IN": "Marathi (मराठी)",
+    "bn-IN": "Bengali (বাংলা)",
+    "kn-IN": "Kannada (ಕನ್ನಡ)",
+    "ml-IN": "Malayalam (മലയാളം)",
+    "gu-IN": "Gujarati (ગુજરાતી)",
+    "pa-IN": "Punjabi (ਪੰਜਾਬੀ)",
+    "en-IN": "English",
+    "en-US": "English",
+}
+
+
+@router.post("/voice-transcribe")
+async def voice_transcribe(
+    audio: UploadFile = File(...),
+    language: str = Form(default="en-IN"),
+    current_user: Dict = Depends(get_current_user),
+):
+    """
+    Transcribe patient voice audio using Gemini's audio understanding API.
+    Accepts WebM/OGG/WAV audio blob, returns plain-text transcript.
+    Supports Tamil, Hindi, Telugu, Marathi, Bengali, English and all Indic languages.
+    """
+    client = _get_gemini_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="Voice transcription unavailable — Gemini API key not set")
+
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio file received")
+
+    # Determine MIME type — browsers record as webm/ogg
+    content_type = audio.content_type or "audio/webm"
+    if "ogg" in content_type:
+        mime_type = "audio/ogg"
+    elif "wav" in content_type:
+        mime_type = "audio/wav"
+    elif "mp4" in content_type or "m4a" in content_type:
+        mime_type = "audio/mp4"
+    elif "mp3" in content_type or "mpeg" in content_type:
+        mime_type = "audio/mp3"
+    else:
+        mime_type = "audio/webm"  # default — Chrome/Firefox MediaRecorder output
+
+    lang_name = _LANG_NAMES.get(language, "the patient's language")
+
+    prompt = (
+        f"This is a patient speaking to a medical intake assistant in {lang_name}. "
+        f"Transcribe exactly what the patient said. "
+        f"Return ONLY the transcript text with no commentary, no translation, no headings. "
+        f"If the speech is unclear or silent, return an empty string."
+    )
+
+    try:
+        from google.genai import types as gtypes
+        response = client.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=[
+                prompt,
+                gtypes.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+            ],
+        )
+        transcript = (response.text or "").strip()
+        # Remove any stray commentary Gemini may have added
+        transcript = re.sub(r"^(transcript:|transcription:)\s*", "", transcript, flags=re.IGNORECASE)
+        transcript = transcript.strip('"\'')
+
+        logger.info("Voice transcribed [%s, %d bytes] → %r", language, len(audio_bytes), transcript[:80])
+        return {"transcript": transcript, "language": language}
+
+    except Exception as e:
+        logger.error("Voice transcription error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 
 def _next_missing_field(collected: Dict) -> Optional[str]:
@@ -286,10 +367,13 @@ async def _gemini_chat(
     """Call Gemini with a stage-aware system prompt and parse the structured data block."""
 
     # Build conversation history (cap at last 10 turns to stay within token budget)
+    # Strip <data> blocks from assistant messages — they confuse the model and cause repeated questions
     contents = []
     for msg in history[-10:]:
         role = "user" if msg.role == "user" else "model"
-        contents.append(types.Content(role=role, parts=[types.Part(text=msg.content)]))
+        clean_content = re.sub(r"\s*<data>[\s\S]*?(?:</data>|$)", "", msg.content).strip()
+        if clean_content:  # skip empty messages that were pure data blocks
+            contents.append(types.Content(role=role, parts=[types.Part(text=clean_content)]))
     contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
 
     system_prompt = _build_system_prompt(collected, turn, next_field)
@@ -300,7 +384,7 @@ async def _gemini_chat(
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
-                max_output_tokens=700,
+                max_output_tokens=1200,
                 temperature=0.3,   # lower = more rule-following
             ),
         )
@@ -309,9 +393,10 @@ async def _gemini_chat(
         logger.error("Gemini API error: %s", e)
         raise
 
-    # Strip the hidden <data> block from what the patient sees
-    data_match = re.search(r"<data>\s*(\{.*?\})\s*</data>", raw, re.DOTALL)
-    visible_text = re.sub(r"\s*<data>.*?</data>", "", raw, flags=re.DOTALL).strip()
+    # Strip the hidden <data> block — robust even if </data> was truncated
+    data_match = re.search(r"<data>\s*(\{.*?\})\s*(?:</data>|$)", raw, re.DOTALL)
+    # Remove <data>...</data> OR <data>... to end-of-string if tag was cut off
+    visible_text = re.sub(r"\s*<data>[\s\S]*$", "", raw).strip()
 
     follow_ups: List[str] = []
     severity: Optional[str] = None
@@ -371,6 +456,10 @@ async def _gemini_chat(
             severity = "CRITICAL" if s >= 9 else "HIGH" if s >= 7 else "MODERATE" if s >= 4 else "LOW"
         except ValueError:
             pass
+
+    # Fallback if visible_text is somehow empty after stripping
+    if not visible_text:
+        visible_text = "Thank you for that information. Let me note that down for your doctor."
 
     return visible_text, follow_ups, severity
 

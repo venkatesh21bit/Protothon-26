@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     # Using Gmail SMTP for patient outreach
     SMTP_SERVER: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
-    SMTP_EMAIL: str = "venkatesh.k21062005@gmail.com"
-    SMTP_PASSWORD: str = "ywqc fghh kgdv kaqe"  # App password
+    SMTP_EMAIL: str = ""  # set via SMTP_EMAIL env var
+    SMTP_PASSWORD: str = ""  # set via SMTP_PASSWORD env var — never commit real passwords
 
     # Nurse Station Alert Email
     NURSE_STATION_EMAIL: str = "nurse.station@hospital.com"

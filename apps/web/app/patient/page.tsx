@@ -7,6 +7,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { useAuthStore, useAudioStore } from '@/lib/store'
 import { 
   Mic, 
+  MicOff,
   MessageCircle, 
   Globe, 
   Send, 
@@ -18,7 +19,8 @@ import {
   Volume2,
   VolumeX,
   RotateCcw,
-  StopCircle
+  StopCircle,
+  Loader2
 } from 'lucide-react'
 
 const LANGUAGES = [
@@ -77,6 +79,10 @@ export default function PatientPage() {
   // Voice State
   const [isListening, setIsListening] = useState(false)
   const [isSpeaking, setIsSpeaking] = useState(false)
+  // Gemini STT recording state
+  const [isRecording, setIsRecording] = useState(false)
+  const [isTranscribing, setIsTranscribing] = useState(false)
+  const [audioLevel, setAudioLevel] = useState(0)
   const [voiceMessages, setVoiceMessages] = useState<ChatMessage[]>([
     {
       id: '1',
@@ -97,6 +103,12 @@ export default function PatientPage() {
   const voiceChatEndRef = useRef<HTMLDivElement>(null)
   const recognitionRef = useRef<any>(null)
   const synthRef = useRef<SpeechSynthesis | null>(null)
+  // Gemini STT refs
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const animFrameRef = useRef<number | null>(null)
 
   // Check authentication
   useEffect(() => {
@@ -120,6 +132,157 @@ export default function PatientPage() {
   useEffect(() => {
     voiceChatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [voiceMessages])
+
+  // ==================== Gemini STT Functions ====================
+
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'
+  const authToken = () => localStorage.getItem('auth_token') || ''
+
+  const startGeminiRecording = useCallback(async () => {
+    if (isRecording) return
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true }
+      })
+
+      // Audio level visualisation
+      const ctx = new AudioContext()
+      const src = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 256
+      src.connect(analyser)
+      audioContextRef.current = ctx
+      analyserRef.current = analyser
+      const tick = () => {
+        if (!analyserRef.current) return
+        const buf = new Uint8Array(analyserRef.current.frequencyBinCount)
+        analyserRef.current.getByteFrequencyData(buf)
+        const avg = buf.reduce((a, b) => a + b, 0) / buf.length
+        setAudioLevel(avg / 255)
+        animFrameRef.current = requestAnimationFrame(tick)
+      }
+      tick()
+
+      // Pick best supported format
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
+        ? 'audio/ogg;codecs=opus'
+        : 'audio/webm'
+
+      const recorder = new MediaRecorder(stream, { mimeType })
+      audioChunksRef.current = []
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data) }
+      recorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop())
+        if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
+        if (audioContextRef.current) audioContextRef.current.close()
+        setAudioLevel(0)
+        await transcribeAudio(new Blob(audioChunksRef.current, { type: mimeType }), mimeType)
+      }
+      recorder.start(250)
+      mediaRecorderRef.current = recorder
+      setIsRecording(true)
+    } catch (err) {
+      console.error('Mic access denied:', err)
+      alert('Microphone access denied. Please allow microphone and try again.')
+    }
+  }, [isRecording, language])
+
+  const stopGeminiRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()
+    }
+    setIsRecording(false)
+  }, [])
+
+  const transcribeAudio = async (blob: Blob, mimeType: string) => {
+    if (blob.size < 1000) return // too short to transcribe
+    setIsTranscribing(true)
+    try {
+      const form = new FormData()
+      form.append('audio', blob, 'recording.webm')
+      form.append('language', language)
+      const res = await fetch(`${API_BASE}/patients/voice-transcribe`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken()}` },
+        body: form,
+      })
+      if (!res.ok) throw new Error('Transcription failed')
+      const { transcript } = await res.json()
+      return transcript as string
+    } catch (err) {
+      console.error('Transcription error:', err)
+      return ''
+    } finally {
+      setIsTranscribing(false)
+    }
+  }
+
+  // Gemini STT for CHAT mode — fills input and submits
+  const handleVoiceInputForChat = useCallback(async () => {
+    if (isRecording) {
+      stopGeminiRecording()
+    } else {
+      if (isTranscribing) return
+      // Start recording; onstop will call transcribeAudio, but we need the text in the input
+      // So we use a one-shot recorder wrapper here
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true }
+        })
+        const ctx = new AudioContext()
+        const src = ctx.createMediaStreamSource(stream)
+        const analyser = ctx.createAnalyser()
+        analyser.fftSize = 256
+        src.connect(analyser)
+        audioContextRef.current = ctx
+        analyserRef.current = analyser
+        const tick = () => {
+          if (!analyserRef.current) return
+          const buf = new Uint8Array(analyserRef.current.frequencyBinCount)
+          analyserRef.current.getByteFrequencyData(buf)
+          setAudioLevel(buf.reduce((a, b) => a + b, 0) / buf.length / 255)
+          animFrameRef.current = requestAnimationFrame(tick)
+        }
+        tick()
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm'
+        const recorder = new MediaRecorder(stream, { mimeType })
+        const chunks: Blob[] = []
+        recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
+        recorder.onstop = async () => {
+          stream.getTracks().forEach(t => t.stop())
+          if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
+          if (audioContextRef.current) audioContextRef.current.close()
+          setAudioLevel(0)
+          setIsTranscribing(true)
+          try {
+            const blob = new Blob(chunks, { type: mimeType })
+            const form = new FormData()
+            form.append('audio', blob, 'recording.webm')
+            form.append('language', language)
+            const res = await fetch(`${API_BASE}/patients/voice-transcribe`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${authToken()}` },
+              body: form,
+            })
+            const { transcript } = await res.json()
+            if (transcript && transcript.trim()) {
+              setChatInput(transcript.trim())
+            }
+          } finally {
+            setIsTranscribing(false)
+          }
+        }
+        recorder.start(250)
+        mediaRecorderRef.current = recorder
+        setIsRecording(true)
+      } catch (err) {
+        console.error('Mic error:', err)
+        alert('Microphone access denied.')
+      }
+    }
+  }, [isRecording, isTranscribing, language, API_BASE])
 
   // ==================== Chat Functions ====================
   
@@ -467,16 +630,87 @@ export default function PatientPage() {
     }
   }
 
-  const handleVoiceOrbClick = () => {
+  const handleVoiceOrbClick = useCallback(async () => {
     if (isSpeaking) {
       synthRef.current?.cancel()
       setIsSpeaking(false)
-    } else if (isListening) {
-      stopListening()
-    } else {
-      startListening()
+      return
     }
-  }
+    if (isRecording) {
+      // Stop recording → transcribe → process
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop()
+      }
+      setIsRecording(false)
+      return
+    }
+    if (isTranscribing) return
+    // Start Gemini recording
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true }
+      })
+      const ctx = new AudioContext()
+      const src = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 256
+      src.connect(analyser)
+      audioContextRef.current = ctx
+      analyserRef.current = analyser
+      const tick = () => {
+        if (!analyserRef.current) return
+        const buf = new Uint8Array(analyserRef.current.frequencyBinCount)
+        analyserRef.current.getByteFrequencyData(buf)
+        setAudioLevel(buf.reduce((a, b) => a + b, 0) / buf.length / 255)
+        animFrameRef.current = requestAnimationFrame(tick)
+      }
+      tick()
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm'
+      const recorder = new MediaRecorder(stream, { mimeType })
+      const chunks: Blob[] = []
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
+      recorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop())
+        if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current)
+        if (audioContextRef.current) audioContextRef.current.close()
+        setAudioLevel(0)
+        setIsTranscribing(true)
+        setIsListening(false)
+        try {
+          const blob = new Blob(chunks, { type: mimeType })
+          if (blob.size < 500) return
+          const form = new FormData()
+          form.append('audio', blob, 'recording.webm')
+          form.append('language', language)
+          const res = await fetch(`${API_BASE}/patients/voice-transcribe`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${authToken()}` },
+            body: form,
+          })
+          const data = await res.json()
+          const transcript = (data.transcript || '').trim()
+          if (transcript) {
+            const userMsg: ChatMessage = {
+              id: Date.now().toString(), role: 'user', content: transcript, timestamp: new Date()
+            }
+            setVoiceMessages(prev => [...prev, userMsg])
+            await processVoiceInput(transcript)
+          }
+        } catch (e) {
+          console.error('Voice transcription error:', e)
+        } finally {
+          setIsTranscribing(false)
+        }
+      }
+      recorder.start(250)
+      mediaRecorderRef.current = recorder
+      setIsRecording(true)
+      setIsListening(true)
+    } catch (err) {
+      console.error('Mic error:', err)
+      alert('Microphone access denied. Please allow microphone access and try again.')
+    }
+  }, [isSpeaking, isRecording, isTranscribing, language, API_BASE])
 
   const handleEndVoiceConversation = () => {
     setVoiceConversationEnded(true)
@@ -779,18 +1013,46 @@ export default function PatientPage() {
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    <form onSubmit={handleChatSubmit} className="flex items-center space-x-3">
+                    <form onSubmit={handleChatSubmit} className="flex items-center space-x-2">
                       <input
                         type="text"
                         value={chatInput}
                         onChange={(e) => setChatInput(e.target.value)}
-                        placeholder="Describe your symptoms..."
-                        className="flex-1 bg-slate-700/50 border border-slate-600 rounded-xl px-4 py-3 text-white placeholder-slate-400 focus:outline-none focus:border-blue-500"
+                        placeholder={isTranscribing ? 'Transcribing…' : isRecording ? 'Recording… tap mic to stop' : 'Describe your symptoms or tap 🎤'}
+                        className={`flex-1 bg-slate-700/50 border rounded-xl px-4 py-3 text-white placeholder-slate-400 focus:outline-none transition-colors ${
+                          isRecording ? 'border-red-500 animate-pulse' : 'border-slate-600 focus:border-blue-500'
+                        }`}
                       />
+                      {/* Gemini Voice Input Button */}
+                      <button
+                        type="button"
+                        onClick={handleVoiceInputForChat}
+                        disabled={isTranscribing}
+                        title={isRecording ? 'Stop recording' : 'Speak your symptoms (Tamil, Hindi, English…)'}
+                        className={`relative flex-shrink-0 w-12 h-12 rounded-xl flex items-center justify-center transition-all ${
+                          isRecording
+                            ? 'bg-red-600 hover:bg-red-700 shadow-lg shadow-red-500/40'
+                            : isTranscribing
+                            ? 'bg-slate-600 cursor-wait'
+                            : 'bg-slate-700 hover:bg-slate-600 border border-slate-600'
+                        }`}
+                      >
+                        {isTranscribing ? (
+                          <Loader2 size={20} className="text-white animate-spin" />
+                        ) : isRecording ? (
+                          <>
+                            <MicOff size={20} className="text-white" />
+                            {/* pulsing ring */}
+                            <span className="absolute inset-0 rounded-xl border-2 border-red-400 animate-ping opacity-60" />
+                          </>
+                        ) : (
+                          <Mic size={20} className="text-slate-300" />
+                        )}
+                      </button>
                       <Button
                         type="submit"
                         disabled={!chatInput.trim() || isTyping}
-                        className="bg-blue-600 hover:bg-blue-700 text-white rounded-xl px-4 py-3 h-auto"
+                        className="bg-blue-600 hover:bg-blue-700 text-white rounded-xl px-4 py-3 h-auto flex-shrink-0"
                       >
                         <Send size={20} />
                       </Button>
@@ -831,18 +1093,20 @@ export default function PatientPage() {
               <div className="px-4 py-3 border-b border-slate-700/50 bg-slate-800/80 flex justify-between items-center">
                 <div className="flex items-center space-x-3">
                   <div className={`w-10 h-10 rounded-full flex items-center justify-center ${
-                    isSpeaking ? 'bg-gradient-to-br from-green-500 to-emerald-400 animate-pulse' : 
-                    isListening ? 'bg-gradient-to-br from-red-500 to-rose-400 animate-pulse' :
+                    isSpeaking ? 'bg-gradient-to-br from-green-500 to-emerald-400 animate-pulse' :
+                    isRecording ? 'bg-gradient-to-br from-red-500 to-rose-400 animate-pulse' :
+                    isTranscribing ? 'bg-gradient-to-br from-yellow-500 to-amber-400' :
                     'bg-gradient-to-br from-blue-500 to-cyan-400'
                   }`}>
                     {isSpeaking ? <Volume2 className="text-white" size={20} /> :
-                     isListening ? <Mic className="text-white" size={20} /> :
+                     isRecording ? <Mic className="text-white" size={20} /> :
+                     isTranscribing ? <Loader2 className="text-white animate-spin" size={20} /> :
                      <MessageCircle className="text-white" size={20} />}
                   </div>
                   <div>
                     <h3 className="text-white font-semibold">Voice Assistant</h3>
                     <p className="text-xs text-green-400">
-                      {isSpeaking ? '🔊 Speaking...' : isListening ? '🎤 Listening...' : 'Ready'}
+                      {isSpeaking ? '🔊 Speaking…' : isTranscribing ? '⏳ Transcribing…' : isRecording ? '🎤 Recording — tap orb to stop' : '● Tap the orb to speak'}
                     </p>
                   </div>
                 </div>
@@ -890,27 +1154,46 @@ export default function PatientPage() {
 
             {/* Voice Orb */}
             <div className="flex flex-col items-center">
-              <div 
-                onClick={handleVoiceOrbClick}
-                className={`w-32 h-32 rounded-full flex items-center justify-center cursor-pointer transition-all transform hover:scale-105 ${
-                  isSpeaking ? 'bg-gradient-to-br from-green-500 to-emerald-400 animate-pulse shadow-lg shadow-green-500/50' :
-                  isListening ? 'bg-gradient-to-br from-red-500 to-rose-400 animate-pulse shadow-lg shadow-red-500/50' :
-                  'bg-gradient-to-br from-blue-500 to-cyan-400 shadow-lg shadow-blue-500/30'
-                }`}
-              >
-                {isSpeaking ? (
-                  <VolumeX className="text-white" size={48} />
-                ) : isListening ? (
-                  <StopCircle className="text-white" size={48} />
-                ) : (
-                  <Mic className="text-white" size={48} />
+              {/* Outer animated ring — scales with live audio level */}
+              <div className="relative flex items-center justify-center">
+                {isRecording && (
+                  <div
+                    className="absolute rounded-full border-4 border-red-400/50 transition-all duration-75"
+                    style={{
+                      width: `${128 + audioLevel * 60}px`,
+                      height: `${128 + audioLevel * 60}px`,
+                    }}
+                  />
                 )}
+                <div
+                  onClick={handleVoiceOrbClick}
+                  className={`w-32 h-32 rounded-full flex items-center justify-center cursor-pointer transition-all transform hover:scale-105 relative ${
+                    isSpeaking
+                      ? 'bg-gradient-to-br from-green-500 to-emerald-400 shadow-lg shadow-green-500/50'
+                      : isTranscribing
+                      ? 'bg-gradient-to-br from-yellow-500 to-amber-400 shadow-lg shadow-yellow-500/40'
+                      : isRecording
+                      ? 'bg-gradient-to-br from-red-500 to-rose-400 shadow-lg shadow-red-500/50'
+                      : 'bg-gradient-to-br from-blue-500 to-cyan-400 shadow-lg shadow-blue-500/30'
+                  }`}
+                >
+                  {isSpeaking ? (
+                    <Volume2 className="text-white" size={48} />
+                  ) : isTranscribing ? (
+                    <Loader2 className="text-white animate-spin" size={48} />
+                  ) : isRecording ? (
+                    <StopCircle className="text-white" size={48} />
+                  ) : (
+                    <Mic className="text-white" size={48} />
+                  )}
+                </div>
               </div>
-              
-              <p className="mt-4 text-slate-400 text-center">
+
+              <p className="mt-4 text-slate-400 text-center text-sm">
                 {isSpeaking ? 'Tap to stop AI speaking' :
-                 isListening ? 'Tap to stop listening' :
-                 'Tap to start speaking'}
+                 isTranscribing ? 'Transcribing with Gemini…' :
+                 isRecording ? `Recording — tap to send  ●  ${selectedLanguage.fullName}` :
+                 `Tap to speak in ${selectedLanguage.fullName}`}
               </p>
 
               {/* Voice Action Buttons */}
