@@ -1,11 +1,13 @@
 """
 LLM Chain - RAG Pipeline for Clinical Documentation
-Integrates AWS Bedrock (Claude) with medical knowledge retrieval
+Powered by Google Gemini 1.5 Flash (replaces AWS Bedrock/Claude)
 """
 import json
 import logging
 from typing import Dict, List, Optional
-import boto3
+
+import google.generativeai as genai
+
 from app.core.config import settings
 from app.core.exceptions import LLMException
 from app.services.llm_engine.prompts import (
@@ -20,22 +22,18 @@ logger = logging.getLogger(__name__)
 
 class MedicalRAGChain:
     """RAG (Retrieval Augmented Generation) pipeline for medical documentation"""
-    
+
     def __init__(self):
-        """Initialize Bedrock client and vector store"""
-        client_config = {'region_name': settings.AWS_REGION}
-        
-        # Use mock mode if in development OR if AWS credentials are not configured
-        # This allows demo mode in production without real AWS Bedrock
-        if settings.ENV == 'development' or not settings.AWS_ACCESS_KEY_ID:
-            self.mock_mode = True
-            logger.info("MedicalRAGChain initialized in mock mode (demo)")
-        else:
+        """Initialize Gemini client"""
+        if settings.GEMINI_API_KEY:
+            genai.configure(api_key=settings.GEMINI_API_KEY)
+            self._gemini = genai.GenerativeModel(settings.GEMINI_MODEL)
             self.mock_mode = False
-            self.bedrock_client = boto3.client('bedrock-runtime', **client_config)
-            logger.info("MedicalRAGChain initialized with AWS Bedrock")
-        
-        self.model_id = settings.BEDROCK_MODEL_ID
+            logger.info("MedicalRAGChain initialized with Gemini %s", settings.GEMINI_MODEL)
+        else:
+            self._gemini = None
+            self.mock_mode = True
+            logger.info("MedicalRAGChain initialized in mock mode (no GEMINI_API_KEY)")
     
     async def translate_to_medical_english(
         self,
@@ -60,7 +58,7 @@ class MedicalRAGChain:
             transcript=transcript
         )
         
-        response = await self._invoke_bedrock(prompt)
+        response = await self._invoke_gemini(prompt)
         return response.strip()
     
     async def generate_soap_note(
@@ -96,7 +94,7 @@ class MedicalRAGChain:
             medical_context=medical_context
         )
         
-        response = await self._invoke_bedrock(prompt, max_tokens=2000)
+        response = await self._invoke_gemini(prompt, max_tokens=2000)
         
         # Parse the SOAP note sections
         soap_note = self._parse_soap_note(response)
@@ -140,7 +138,7 @@ class MedicalRAGChain:
             medical_context=medical_context
         )
         
-        response = await self._invoke_bedrock(prompt, max_tokens=1500)
+        response = await self._invoke_gemini(prompt, max_tokens=1500)
         
         # Parse differential diagnosis
         dd_list = self._parse_differential_diagnosis(response)
@@ -163,7 +161,7 @@ class MedicalRAGChain:
             patient_data=json.dumps(patient_data, indent=2)
         )
         
-        response = await self._invoke_bedrock(prompt, max_tokens=800)
+        response = await self._invoke_gemini(prompt, max_tokens=800)
         
         # Parse JSON response
         try:
@@ -179,48 +177,34 @@ class MedicalRAGChain:
         
         return red_flags
     
-    async def _invoke_bedrock(self, prompt: str, max_tokens: int = 1024) -> str:
+    async def _invoke_gemini(self, prompt: str, max_tokens: int = 1024) -> str:
         """
-        Invoke AWS Bedrock (Claude model)
-        
+        Invoke Google Gemini 1.5 Flash.
+
         Args:
             prompt: Prompt text
-            max_tokens: Maximum response tokens
-            
+            max_tokens: Maximum response tokens (passed as generation config)
+
         Returns:
             Model response text
         """
         try:
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": max_tokens,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,  # Lower temperature for medical accuracy
-                "top_p": 0.9
-            }
-            
-            response = self.bedrock_client.invoke_model(
-                modelId=self.model_id,
-                body=json.dumps(request_body)
+            response = self._gemini.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    max_output_tokens=max_tokens,
+                    temperature=0.3,
+                    top_p=0.9,
+                ),
             )
-            
-            response_body = json.loads(response['body'].read())
-            text = response_body['content'][0]['text']
-            
-            return text
-            
-        except Exception as e:
-            logger.error(f"Bedrock invocation error: {str(e)}")
+            return response.text
+        except Exception as exc:
+            logger.error("Gemini invocation error: %s", exc)
             raise LLMException(
-                message=f"LLM processing failed: {str(e)}",
-                details={"model": self.model_id}
+                message=f"LLM processing failed: {exc}",
+                details={"model": settings.GEMINI_MODEL},
             )
-    
+
     async def _retrieve_medical_context(self, query: str) -> str:
         """
         Retrieve relevant medical knowledge from vector store

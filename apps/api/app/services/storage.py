@@ -13,45 +13,47 @@ logger = logging.getLogger(__name__)
 
 
 class S3StorageService:
-    """Service for managing audio files in S3"""
-    
+    """Storage service backed by Cloudflare R2 (S3-compatible API)."""
+
     def __init__(self):
-        """Initialize S3 client"""
+        """Initialize Cloudflare R2 client using boto3 S3-compatible API."""
+        # Derive endpoint from account ID if not explicitly set
+        endpoint = settings.R2_ENDPOINT_URL or (
+            f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+            if settings.R2_ACCOUNT_ID
+            else None
+        )
+
         client_config = {
-            'region_name': settings.AWS_REGION
+            "region_name": "auto",  # R2 uses 'auto' as the region
         }
-        
-        # For local development with LocalStack
-        if settings.S3_ENDPOINT_URL:
-            client_config['endpoint_url'] = settings.S3_ENDPOINT_URL
-            client_config['aws_access_key_id'] = 'test'
-            client_config['aws_secret_access_key'] = 'test'
-        
-        self.s3_client = boto3.client('s3', **client_config)
-        self.bucket_name = settings.S3_BUCKET_NAME
-        
-        # Ensure bucket exists
+        if endpoint:
+            client_config["endpoint_url"] = endpoint
+        if settings.R2_ACCESS_KEY_ID:
+            client_config["aws_access_key_id"] = settings.R2_ACCESS_KEY_ID
+            client_config["aws_secret_access_key"] = settings.R2_SECRET_ACCESS_KEY
+
+        self.s3_client = boto3.client("s3", **client_config)
+        self.bucket_name = settings.R2_BUCKET_NAME
+
+        # Ensure bucket exists (best-effort)
         self._ensure_bucket_exists()
     
     def _ensure_bucket_exists(self):
-        """Create bucket if it doesn't exist"""
+        """Create bucket if it doesn't exist (non-fatal)."""
         try:
             self.s3_client.head_bucket(Bucket=self.bucket_name)
-            logger.info(f"Bucket {self.bucket_name} exists")
+            logger.info(f"R2 bucket '{self.bucket_name}' exists")
         except ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code == '404':
+            code = e.response["Error"]["Code"]
+            if code in ("404", "NoSuchBucket"):
                 try:
-                    if settings.AWS_REGION == 'us-east-1':
-                        self.s3_client.create_bucket(Bucket=self.bucket_name)
-                    else:
-                        self.s3_client.create_bucket(
-                            Bucket=self.bucket_name,
-                            CreateBucketConfiguration={'LocationConstraint': settings.AWS_REGION}
-                        )
-                    logger.info(f"Created bucket {self.bucket_name}")
+                    self.s3_client.create_bucket(Bucket=self.bucket_name)
+                    logger.info(f"Created R2 bucket '{self.bucket_name}'")
                 except Exception as create_error:
-                    logger.error(f"Error creating bucket: {str(create_error)}")
+                    logger.warning(f"Could not create R2 bucket: {create_error}")
+            else:
+                logger.warning(f"R2 head_bucket error (ignored): {e}")
     
     def generate_presigned_url(
         self,
@@ -71,7 +73,7 @@ class S3StorageService:
             Presigned URL string
         """
         try:
-            expiration = expiration or settings.S3_PRESIGNED_URL_EXPIRATION
+            expiration = expiration or 600  # 10 minutes default
             
             url = self.s3_client.generate_presigned_url(
                 ClientMethod=operation,
@@ -177,8 +179,13 @@ class S3StorageService:
             )
     
     def get_file_url(self, object_key: str) -> str:
-        """Get permanent S3 URL (for internal use)"""
-        return f"https://{self.bucket_name}.s3.{settings.AWS_REGION}.amazonaws.com/{object_key}"
+        """Get public R2 URL (only works if bucket has public access enabled)."""
+        endpoint = settings.R2_ENDPOINT_URL or (
+            f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+            if settings.R2_ACCOUNT_ID
+            else "https://r2.cloudflarestorage.com"
+        )
+        return f"{endpoint}/{self.bucket_name}/{object_key}"
 
 
 class InMemoryStorageService:

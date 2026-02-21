@@ -11,19 +11,24 @@ services:
     environment:
       - ENV=development
       - DEBUG=True
-      - AWS_REGION=ap-south-1
-      - DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
-      - DYNAMODB_TABLE_NAME=NidaanVisits
-      - S3_BUCKET_NAME=nidaan-audio-storage
-      - JWT_SECRET=dev-secret-change-in-production
-      - AWS_ACCESS_KEY_ID=test
-      - AWS_SECRET_ACCESS_KEY=test
+      - DATABASE_URL=postgresql+asyncpg://nidaan:nidaan123@postgres:5432/nidaan
       - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=dev-secret-change-in-production
+      # Gemini — set your key here or in .env
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=gemini-1.5-flash
+      # Cloudflare R2 — optional for local dev
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID:-}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_BUCKET_NAME=nidaan-audio-storage
+      # Email
+      - SMTP_EMAIL=${SMTP_EMAIL:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
     volumes:
       - ./apps/api:/app
     depends_on:
-      - dynamodb-local
-      - localstack
+      - postgres
       - redis
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
@@ -45,31 +50,7 @@ services:
       - api
     command: npm run dev
 
-  # Local DynamoDB
-  dynamodb-local:
-    image: amazon/dynamodb-local:latest
-    ports:
-      - "8001:8000"
-    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath ./data"
-    volumes:
-      - ./infra/docker/dynamodb-data:/home/dynamodblocal/data
-
-  # LocalStack (for S3, SQS, etc.)
-  localstack:
-    image: localstack/localstack:latest
-    ports:
-      - "4566:4566"
-      - "4571:4571"
-    environment:
-      - SERVICES=s3,sqs,lambda,cognito-idp
-      - DEBUG=1
-      - DATA_DIR=/tmp/localstack/data
-      - DOCKER_HOST=unix:///var/run/docker.sock
-    volumes:
-      - "./infra/docker/localstack-data:/tmp/localstack"
-      - "/var/run/docker.sock:/var/run/docker.sock"
-
-  # PostgreSQL (Optional - for relational data)
+  # PostgreSQL
   postgres:
     image: postgres:15-alpine
     ports:
@@ -80,8 +61,13 @@ services:
       - POSTGRES_PASSWORD=nidaan123
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nidaan"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  # Redis (for caching and real-time features)
+  # Redis
   redis:
     image: redis:7-alpine
     ports:

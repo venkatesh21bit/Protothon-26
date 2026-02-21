@@ -36,14 +36,21 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 60)
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     logger.info(f"Environment: {settings.ENV}")
-    logger.info(f"Region: {settings.AWS_REGION}")
     logger.info("=" * 60)
-    
-    # Initialize Triage Services (IBM Cloud)
+
+    # Create / verify PostgreSQL tables
+    try:
+        from app.core.db import create_tables
+        await create_tables()
+        logger.info("✅ PostgreSQL tables ready")
+    except Exception as e:
+        logger.warning(f"⚠️ DB table creation failed (non-critical): {e}")
+
+    # Initialize Triage Services
     try:
         from app.services.ibm.triage_engine import triage_engine
         await triage_engine.initialize()
-        logger.info("✅ IBM Triage Services initialized")
+        logger.info("✅ Triage Services initialized")
     except Exception as e:
         logger.warning(f"⚠️ Triage services init failed (non-critical): {e}")
     

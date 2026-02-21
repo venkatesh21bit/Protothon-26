@@ -1,36 +1,27 @@
 """
 Speech Transcription Service
-Handles AWS Transcribe operations for audio-to-text conversion
+Wraps the Gemini-based STT for audio-from-URL scenarios.
+AWS Transcribe has been replaced — this stub keeps backward compat.
 """
 import asyncio
-import boto3
-import time
 import logging
 from typing import Dict, Optional
 from app.core.config import settings
-from app.core.exceptions import TranscriptionException
 
 logger = logging.getLogger(__name__)
 
 
 class SpeechService:
-    """Service for transcribing audio using AWS Transcribe"""
-    
+    """
+    Legacy transcription service shim.
+    Direct audio-bytes transcription is now handled by
+    app.services.ibm.speech_to_text (Gemini).
+    This class provides mock responses for backward compat.
+    """
+
     def __init__(self):
-        """Initialize AWS Transcribe client"""
-        client_config = {
-            'region_name': settings.AWS_REGION
-        }
-        
-        # Use mock mode if in development OR if AWS credentials are not configured
-        # This allows demo mode in production without real S3/Transcribe
-        if settings.ENV == 'development' or not settings.AWS_ACCESS_KEY_ID:
-            self.mock_mode = True
-            logger.info("SpeechService initialized in mock mode (demo)")
-        else:
-            self.mock_mode = False
-            self.transcribe_client = boto3.client('transcribe', **client_config)
-            logger.info("SpeechService initialized with AWS Transcribe")
+        self.mock_mode = True
+        logger.info("SpeechService initialized (mock mode — use IBMSpeechToText for real STT)")
     
     async def transcribe_audio(
         self,
