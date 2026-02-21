@@ -9,11 +9,17 @@ import uuid
 import logging
 
 from app.core.security import get_current_user
+from app.core.db import save_triage_case
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
 # ==================== Models ====================
+
+class _ChatMsg(BaseModel):
+    role: str
+    content: str
 
 class AppointmentCreate(BaseModel):
     patient_name: str
@@ -27,6 +33,7 @@ class AppointmentCreate(BaseModel):
     preferred_time: Optional[str] = None
     notes: Optional[str] = None
     language: str = "en-IN"
+    conversation_history: Optional[List[_ChatMsg]] = []
 
 class AppointmentResponse(BaseModel):
     id: str
@@ -287,63 +294,116 @@ async def _send_confirmation_emails(appointment_data: Dict):
         logger.error(f"Email sending error: {str(e)}")
 
 
-async def _create_doctor_visit(appointment_data: Dict):
-    """Create a visit in db_client so it shows on doctor dashboard"""
+async def _generate_soap_note(appointment_data: Dict) -> Dict:
+    """Generate SOAP note from appointment data using Gemini."""
+    symptoms     = appointment_data.get('symptoms', [])
+    details      = appointment_data.get('symptom_details', '')
+    severity     = appointment_data.get('severity', 'not specified')
+    duration     = appointment_data.get('duration', 'not specified')
+    history      = appointment_data.get('conversation_history', [])
+    patient_name = appointment_data.get('patient_name', 'Patient')
+
+    # Build a readable conversation transcript
+    transcript_lines = []
+    for msg in (history or []):
+        role = msg.get('role', '')
+        content = msg.get('content', '')
+        prefix = 'Patient' if role == 'user' else 'AI'
+        transcript_lines.append(f"{prefix}: {content}")
+    conversation_text = '\n'.join(transcript_lines) or details
+
+    fallback = {
+        'subjective': f"Patient {patient_name} reports: {', '.join(symptoms)}. {details}",
+        'objective':  f"Severity: {severity}. Duration: {duration}.",
+        'assessment': f"Pending doctor evaluation. Reported symptoms: {', '.join(symptoms)}.",
+        'plan':       "Doctor to review and provide clinical assessment."
+    }
+
+    if not settings.GEMINI_API_KEY:
+        return fallback
+
     try:
-        from app.core.db import db_client
-        
-        # Map urgency to risk level
-        urgency = appointment_data.get('ai_urgency', 'low')
-        risk_map = {
-            'critical': 'CRITICAL',
-            'high': 'HIGH',
-            'medium': 'MODERATE',
-            'low': 'LOW'
-        }
-        risk_level = risk_map.get(urgency, 'LOW')
-        
-        # Create visit data for doctor dashboard
+        from google import genai
+        from google.genai import types as gtypes
+
+        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        prompt = f"""You are a clinical documentation AI. Based on the patient intake conversation below, generate a concise SOAP note for the doctor.
+
+Patient: {patient_name}
+Symptoms reported: {', '.join(symptoms)}
+Duration: {duration}
+Severity: {severity}
+
+Full intake conversation:
+{conversation_text}
+
+Respond ONLY with valid JSON (no markdown):
+{{
+  "subjective": "What the patient reported in their own words",
+  "objective": "Measurable observations: severity score, duration, location, vital signs if mentioned",
+  "assessment": "Clinical impression based on reported symptoms — do not diagnose, use phrases like 'consistent with', 'suggests', 'rule out'",
+  "plan": "Recommended next steps: tests to order, referrals, follow-up"
+}}"""
+        response = client.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=[gtypes.Content(role='user', parts=[gtypes.Part(text=prompt)])],
+            config=gtypes.GenerateContentConfig(max_output_tokens=1500, temperature=0.2)
+        )
+        import re, json
+        raw = response.text or ''
+        # Robustly extract the JSON object — handles code fences, leading text, etc.
+        json_match = re.search(r'\{[\s\S]*\}', raw)
+        if not json_match:
+            raise ValueError("No JSON object found in Gemini response")
+        soap = json.loads(json_match.group(0))
+        return soap
+    except Exception as e:
+        logger.warning("SOAP generation failed: %s — using fallback", e)
+        return fallback
+
+
+async def _create_doctor_visit(appointment_data: Dict):
+    """Generate SOAP note and persist visit to PostgreSQL for the doctor dashboard."""
+    try:
+        urgency = appointment_data.get('ai_urgency', 'low') or 'low'
+        risk_map = {'critical': 'CRITICAL', 'high': 'HIGH', 'medium': 'MODERATE', 'low': 'LOW'}
+        risk_level = risk_map.get(urgency.lower(), 'LOW')
+
+        soap = await _generate_soap_note(appointment_data)
+
         visit_data = {
-            'visit_id': appointment_data.get('id'),
-            'clinic_id': 'CLINIC_DEMO',  # Use CLINIC_DEMO to match demo users
-            'patient_id': appointment_data.get('patient_id'),
-            'doctor_id': appointment_data.get('doctor_id'),
-            'patient_name': appointment_data.get('patient_name', 'Unknown'),
-            'patient_age': 30,  # Default age
-            'chief_complaint': ', '.join(appointment_data.get('symptoms', [])) or 'General consultation',
-            'symptom_details': appointment_data.get('symptom_details', ''),
-            'status': 'COMPLETED',  # Shows as completed visit
-            'risk_level': risk_level,
-            'language_code': 'hi-IN',
-            'transcript': appointment_data.get('symptom_details', ''),
-            'translated_text': appointment_data.get('symptom_details', ''),
-            'soap_note': {
-                'subjective': f"Patient reports: {', '.join(appointment_data.get('symptoms', []))}. {appointment_data.get('symptom_details', '')}",
-                'objective': f"Severity: {appointment_data.get('severity', 'Not specified')}. Duration: {appointment_data.get('duration', 'Not specified')}.",
-                'assessment': f"AI Assessment: {appointment_data.get('ai_urgency', 'pending')} urgency. Possible conditions: {', '.join(appointment_data.get('ai_conditions', []))}",
-                'plan': f"Scheduled appointment on {appointment_data.get('scheduled_date')} at {appointment_data.get('scheduled_time')} with {appointment_data.get('doctor_name', 'Doctor')}. Department: {appointment_data.get('ai_department', 'General')}"
-            },
+            'visit_id':          appointment_data.get('id'),
+            'clinic_id':         'CLINIC_DEMO',
+            'patient_id':        appointment_data.get('patient_id'),
+            'doctor_id':         appointment_data.get('doctor_id') or 'UNASSIGNED',
+            'patient_name':      appointment_data.get('patient_name', 'Unknown'),
+            'patient_age':       appointment_data.get('patient_age', 0),
+            'chief_complaint':   ', '.join(appointment_data.get('symptoms', [])) or 'General consultation',
+            'symptom_details':   appointment_data.get('symptom_details', ''),
+            'status':            'pending',
+            'risk_level':        risk_level,
+            'severity_score':    risk_level,
+            'language_code':     appointment_data.get('language', 'en-IN'),
+            'transcript':        appointment_data.get('symptom_details', ''),
+            'soap_note':         soap,
             'differential_diagnosis': [
-                {'condition': cond, 'probability': 0.7, 'reasoning': 'AI-identified based on symptoms'}
-                for cond in appointment_data.get('ai_conditions', [])[:3]
+                {'condition': c, 'probability': 0.6, 'reasoning': 'Reported symptom match'}
+                for c in appointment_data.get('ai_conditions', [])[:3]
             ],
             'red_flags': {
                 'has_red_flags': urgency in ['critical', 'high'],
                 'severity': risk_level,
                 'red_flags_detected': [],
-                'triage_recommendation': f"Care Level {appointment_data.get('ai_care_level', 3)} - {appointment_data.get('ai_department', 'General')}"
+                'triage_recommendation': f"Urgency: {urgency.upper()}"
             },
-            'processing_time_seconds': 11.57,
-            'scheduled_date': appointment_data.get('scheduled_date'),
-            'scheduled_time': appointment_data.get('scheduled_time')
+            'appointment_id':    appointment_data.get('id'),
+            'created_at':        appointment_data.get('created_at', datetime.utcnow().isoformat()),
         }
-        
-        # Create visit in database
-        db_client.create_visit(visit_data)
-        logger.info(f"Created doctor visit for appointment {appointment_data.get('id')}")
-        
+
+        await save_triage_case(visit_data)
+        logger.info("Saved doctor visit for appointment %s", appointment_data.get('id'))
     except Exception as e:
-        logger.error(f"Error creating doctor visit: {str(e)}")
+        logger.error("Error creating doctor visit: %s", e)
 
 # ==================== Endpoints ====================
 
@@ -386,11 +446,17 @@ async def create_appointment(
             "created_at": now,
             "updated_at": now,
             "ai_processed": False,
-            "email_sent": False
+            "email_sent": False,
+            # Carry conversation history for SOAP generation
+            "conversation_history": [m.dict() for m in (appointment.conversation_history or [])],
+            "language": appointment.language,
         }
         
         _appointments[apt_id] = new_appointment
         logger.info(f"Created appointment: {apt_id} for patient {current_user.get('user_id')}")
+
+        # ===== ALWAYS save a visit to the doctor dashboard =====
+        await _create_doctor_visit(new_appointment)
         
         # ===== AUTO-TRIGGER AI AGENTS =====
         if appointment.symptoms:
@@ -417,18 +483,15 @@ async def create_appointment(
                     "updated_at": datetime.utcnow().isoformat() + "Z"
                 })
                 _appointments[apt_id] = new_appointment
-                logger.info(f"AI processed appointment {apt_id}: scheduled for {updates.get('scheduled_date')} at {updates.get('scheduled_time')}")
+
+                # Update the saved visit with AI data + refreshed SOAP
+                await _create_doctor_visit(new_appointment)
                 
                 # ===== AUTO-SEND CONFIRMATION EMAILS =====
                 if new_appointment.get('status') == 'confirmed':
                     await _send_confirmation_emails(new_appointment)
                     new_appointment['email_sent'] = True
                     _appointments[apt_id] = new_appointment
-                    logger.info(f"Confirmation emails sent for appointment {apt_id}")
-                    
-                    # ===== CREATE DOCTOR DASHBOARD VISIT =====
-                    await _create_doctor_visit(new_appointment)
-                    logger.info(f"Created doctor dashboard visit for appointment {apt_id}")
         
         return AppointmentResponse(**{k: v for k, v in new_appointment.items() if k in AppointmentResponse.__annotations__})
         

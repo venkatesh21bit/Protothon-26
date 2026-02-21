@@ -110,10 +110,83 @@ CREATE INDEX IF NOT EXISTS idx_ehr_patient
 
 
 async def create_tables() -> None:
-    """Create all tables (idempotent — safe to call on every startup)."""
+    """Create all tables (idempotent — safe to call on every startup).
+    SQLAlchemy 2.x execute() only supports one statement per call, so we split.
+    """
+    statements = [s.strip() for s in _CREATE_TABLES_SQL.split(";") if s.strip()]
     async with engine.begin() as conn:
-        await conn.execute(text(_CREATE_TABLES_SQL))
+        for stmt in statements:
+            await conn.execute(text(stmt))
     logger.info("Database tables created / verified")
+
+
+# ---------------------------------------------------------------------------
+# Real async DB helpers — used by visits/doctor dashboard
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+async def save_triage_case(data: dict) -> None:
+    """Insert or replace a triage case (visit) in PostgreSQL."""
+    case_id    = data.get("visit_id") or data.get("id")
+    patient_id = data.get("patient_id", "unknown")
+    severity   = data.get("severity_score") or data.get("risk_level", "LOW")
+    visit_status = data.get("status", "pending")
+
+    sql = text("""
+        INSERT INTO triage_cases (id, patient_id, severity_score, status, data, created_at, updated_at)
+        VALUES (:id, :patient_id, :severity_score, :status, CAST(:data_json AS jsonb), NOW(), NOW())
+        ON CONFLICT (id) DO UPDATE
+        SET severity_score = EXCLUDED.severity_score,
+            status         = EXCLUDED.status,
+            data           = EXCLUDED.data,
+            updated_at     = NOW()
+    """)
+    async with engine.begin() as conn:
+        await conn.execute(sql, {
+            "id":            case_id,
+            "patient_id":    patient_id,
+            "severity_score": severity,
+            "status":        visit_status,
+            "data_json":     _json.dumps(data),
+        })
+    logger.info("Saved triage case %s", case_id)
+
+
+async def fetch_triage_cases(clinic_id: str, limit: int = 50) -> list:
+    """Return all triage cases as dicts, newest first."""
+    sql = text("""
+        SELECT data, created_at
+        FROM triage_cases
+        ORDER BY created_at DESC
+        LIMIT :limit
+    """)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(sql, {"limit": limit})
+        rows = result.fetchall()
+
+    cases = []
+    for row in rows:
+        try:
+            rec = row[0] if isinstance(row[0], dict) else _json.loads(row[0])
+            if not rec.get("created_at"):
+                rec["created_at"] = row[1].isoformat() if row[1] else ""
+            cases.append(rec)
+        except Exception:
+            pass
+    return cases
+
+
+async def fetch_triage_case(visit_id: str) -> dict | None:
+    """Return a single triage case by visit_id, or None."""
+    sql = text("SELECT data FROM triage_cases WHERE id = :id")
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(sql, {"id": visit_id})
+        row = result.fetchone()
+    if not row:
+        return None
+    rec = row[0] if isinstance(row[0], dict) else _json.loads(row[0])
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +196,7 @@ async def create_tables() -> None:
 class _NoOpDBClient:
     """Stub so that any stray `from app.core.db import db_client` doesn't crash.
     Returns empty/safe values so routes that still call db_client don't 500.
-    Real data access should go through cloudant_service (PostgreSQL).
+    Real data access should go through save_triage_case / fetch_triage_cases.
     """
     class _NoOpCallable:
         def __call__(self, *args, **kwargs):
@@ -136,5 +209,5 @@ class _NoOpDBClient:
 
 
 db_client = _NoOpDBClient()
-# END OF FILE — original DynamoDB code removed
+# END OF FILE
 

@@ -248,7 +248,10 @@ export default function PatientPage() {
           severity: collectedData.severity || null,
           duration: collectedData.duration || null,
           notes: `Collected via AI chat on ${new Date().toLocaleDateString()}`,
-          language: language
+          language: language,
+          conversation_history: chatMessages
+            .filter(m => m.role !== 'system')
+            .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }))
         })
       })
       

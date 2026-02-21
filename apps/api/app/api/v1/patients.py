@@ -6,10 +6,16 @@ from typing import List, Dict, Optional
 from datetime import datetime
 from pydantic import BaseModel
 import uuid
+import json
+import re
 import logging
+
+from google import genai
+from google.genai import types
 
 from app.core.security import get_current_user
 from app.core.db import db_client
+from app.core.config import settings
 from app.schemas.patient import PatientCreate, PatientResponse, PatientUpdate
 
 logger = logging.getLogger(__name__)
@@ -35,40 +41,176 @@ class ChatResponse(BaseModel):
 class ResetRequest(BaseModel):
     confirm: bool = True
 
-# In-memory conversation storage for demo
+# In-memory conversation storage
 _conversations: Dict[str, List[Dict]] = {}
 _collected_data: Dict[str, Dict] = {}
 
+# ==================== Gemini client (lazy init) ====================
+
+_gemini_client: Optional[genai.Client] = None
+
+MAX_TURNS = 12  # hard ceiling — after this, wrap up regardless
+
+# Required fields and the order in which to collect them
+INTAKE_FIELDS = ["symptoms", "duration", "severity", "location", "associated_symptoms", "medical_history"]
+INTAKE_THRESHOLD = 4  # minimum fields needed before intake is considered complete
+
+def _get_gemini_client() -> Optional[genai.Client]:
+    global _gemini_client
+    if _gemini_client is None and settings.GEMINI_API_KEY:
+        _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    return _gemini_client
+
+def _build_system_prompt(collected: Dict, turn: int, next_field: Optional[str]) -> str:
+    """Build a fully explicit system prompt tailored to the current intake stage."""
+
+    # Summarise what has already been collected so Gemini doesn't re-ask
+    collected_summary = []
+    if collected["symptoms"]:
+        collected_summary.append(f"- Symptoms: {', '.join(collected['symptoms'])}")
+    if collected["duration"]:
+        collected_summary.append(f"- Duration: {collected['duration']}")
+    if collected["severity"]:
+        collected_summary.append(f"- Severity: {collected['severity']}/10")
+    if collected["location"]:
+        collected_summary.append(f"- Location: {collected['location']}")
+    if collected["associated_symptoms"]:
+        collected_summary.append(f"- Associated symptoms: {', '.join(collected['associated_symptoms'])}")
+    if collected["medical_history"]:
+        collected_summary.append(f"- Medical history / medications: {', '.join(collected['medical_history'])}")
+
+    collected_text = "\n".join(collected_summary) if collected_summary else "Nothing collected yet."
+
+    # Map next_field → a natural question to ask
+    field_questions = {
+        "symptoms":           "Ask the patient what symptoms they are experiencing.",
+        "duration":           "Ask how long they have been experiencing these symptoms (e.g. hours, days, weeks).",
+        "severity":           "Ask them to rate their discomfort on a scale of 1 to 10.",
+        "location":           "Ask where exactly on their body they feel the symptom (which side, area).",
+        "associated_symptoms":"Ask if they have any other symptoms alongside the main one (e.g. nausea, fever, dizziness).",
+        "medical_history":    "Ask if they have any known medical conditions or are currently taking any medications.",
+    }
+
+    if turn >= MAX_TURNS:
+        next_instruction = (
+            "You have reached the maximum number of turns. "
+            "Summarise everything collected and tell the patient their doctor will review the details shortly. "
+            "Do NOT ask any more questions."
+        )
+    elif next_field:
+        next_instruction = field_questions.get(next_field, "Ask the most relevant follow-up question based on what is missing.")
+    else:
+        next_instruction = (
+            "All required information has been collected. "
+            "Provide a warm closing summary of what was noted and reassure the patient their doctor will review it. "
+            "Do NOT ask any more questions."
+        )
+
+    return f"""You are Nidaan AI, a compassionate medical intake assistant for an Indian clinic.
+Your ONLY job is to collect patient symptom information BEFORE their doctor consultation.
+You do NOT diagnose, treat, or speculate about conditions.
+
+════════════════════════════════════════
+LANGUAGE RULE
+════════════════════════════════════════
+Detect the language the patient writes in (Hindi, Tamil, Telugu, Marathi, Bengali, English) and reply in the SAME language.
+
+════════════════════════════════════════
+ABSOLUTE FORBIDDEN RESPONSES — never violate these
+════════════════════════════════════════
+1. NEVER say what disease or condition the patient might have.
+   If asked ("What do I have?", "Is it serious?", "Do I have X?", "Am I okay?"):
+   → Reply: "I'm not able to share diagnoses — your doctor will discuss that with you during your consultation."
+2. NEVER recommend medications, dosages, or home remedies.
+3. NEVER give a prognosis or tell the patient whether their condition is dangerous.
+4. NEVER answer general medical knowledge questions (e.g. "What causes migraines?").
+   → Reply: "That's a great question for your doctor. I'm here to note down your symptoms."
+5. NEVER go off-topic (personal chat, non-medical topics, jokes).
+   → Gently redirect: "I'm here to collect your health information before your consultation."
+6. NEVER ask more than ONE question per reply.
+
+════════════════════════════════════════
+INFORMATION ALREADY COLLECTED THIS SESSION
+════════════════════════════════════════
+{collected_text}
+
+════════════════════════════════════════
+YOUR NEXT ACTION (follow this exactly)
+════════════════════════════════════════
+{next_instruction}
+
+════════════════════════════════════════
+EMERGENCY RULE
+════════════════════════════════════════
+If the patient describes severe chest pain radiating to the arm/jaw, sudden inability to speak, facial drooping, or inability to breathe — IMMEDIATELY advise them to call emergency services (112 in India) before anything else.
+
+════════════════════════════════════════
+OUTPUT FORMAT (mandatory — do not skip)
+════════════════════════════════════════
+Write your conversational reply to the patient FIRST.
+Then, on a new line, include EXACTLY this hidden block (never shown to the patient):
+
+<data>
+{{
+  "symptoms": ["extracted symptom 1", "extracted symptom 2"],
+  "duration": "e.g. 2 days or null",
+  "severity_score": 7,
+  "location": "e.g. left side of head or null",
+  "associated": ["nausea", "light sensitivity"],
+  "history": ["diabetes", "paracetamol"],
+  "severity_band": "HIGH|MODERATE|LOW|null",
+  "intake_complete": false,
+  "follow_ups": ["Short option 1", "Short option 2", "Short option 3"]
+}}
+</data>
+
+Rules for the <data> block:
+- Only include symptoms/details MENTIONED by the patient in this conversation.
+- follow_ups are 2-3 SHORT tap-friendly quick-reply suggestions (not questions, just options like "2 days", "Left side", "No other symptoms").
+- intake_complete = true only when symptoms + duration + severity are all known.
+- severity_score: integer 1-10 if mentioned, else null.
+"""
+
 
 @router.post("/chat/reset")
-async def reset_patient_chat(
-    current_user: Dict = Depends(get_current_user)
-):
-    """
-    Reset patient conversation data to start fresh.
-    Clears all collected symptoms and conversation history.
-    """
+async def reset_patient_chat(current_user: Dict = Depends(get_current_user)):
+    """Reset patient conversation to start fresh."""
     try:
         user_id = current_user.get('user_id', 'anonymous')
-        
-        # Clear conversation history
-        if user_id in _conversations:
-            del _conversations[user_id]
-        
-        # Clear collected data
-        if user_id in _collected_data:
-            del _collected_data[user_id]
-        
-        logger.info(f"Reset conversation for user: {user_id}")
-        
+        _conversations.pop(user_id, None)
+        _collected_data.pop(user_id, None)
         return {"message": "Conversation reset successfully", "user_id": user_id}
-        
     except Exception as e:
         logger.error(f"Reset error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Reset failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Reset failed: {str(e)}")
+
+
+def _next_missing_field(collected: Dict) -> Optional[str]:
+    """Return the next intake field that still needs to be collected, in priority order."""
+    if not collected["symptoms"]:
+        return "symptoms"
+    if not collected["duration"]:
+        return "duration"
+    if not collected["severity"]:
+        return "severity"
+    if not collected["location"]:
+        return "location"
+    if not collected["associated_symptoms"]:
+        return "associated_symptoms"
+    if not collected["medical_history"]:
+        return "medical_history"
+    return None  # all collected
+
+
+def _fields_collected_count(collected: Dict) -> int:
+    count = 0
+    if collected["symptoms"]: count += 1
+    if collected["duration"]: count += 1
+    if collected["severity"]: count += 1
+    if collected["location"]: count += 1
+    if collected["associated_symptoms"]: count += 1
+    if collected["medical_history"]: count += 1
+    return count
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -76,317 +218,162 @@ async def patient_chat(
     chat_request: ChatRequest,
     current_user: Dict = Depends(get_current_user)
 ):
-    """
-    AI-powered patient symptom collection chat.
-    Uses context-aware responses to gather medical information.
-    """
+    """AI-powered patient symptom collection chat — powered by Google Gemini."""
     try:
         user_id = current_user.get('user_id', 'anonymous')
-        message = chat_request.message.lower()
         history = chat_request.conversation_history or []
-        
-        # If conversation history is empty or very short, start fresh
+
+        # Fresh conversation on first message
         if len(history) <= 1:
-            # Clear previous data for fresh conversation
-            if user_id in _collected_data:
-                del _collected_data[user_id]
-            if user_id in _conversations:
-                del _conversations[user_id]
-        
-        # Initialize or get conversation data
-        if user_id not in _collected_data:
-            _collected_data[user_id] = {
-                'symptoms': [],
-                'duration': None,
-                'severity': None,
-                'location': None,
-                'associated_symptoms': [],
-                'triggers': [],
-                'medical_history': [],
-            }
-        
-        collected = _collected_data[user_id]
-        
-        # Analyze message and extract information
-        response, follow_ups, severity = await _process_patient_message(
-            message, history, collected
-        )
-        
-        # Store conversation
-        if user_id not in _conversations:
-            _conversations[user_id] = []
-        _conversations[user_id].append({'role': 'user', 'content': chat_request.message})
-        _conversations[user_id].append({'role': 'assistant', 'content': response})
-        
+            _collected_data.pop(user_id, None)
+            _conversations.pop(user_id, None)
+
+        collected = _collected_data.setdefault(user_id, {
+            'symptoms': [], 'duration': None, 'severity': None,
+            'location': None, 'associated_symptoms': [], 'medical_history': [],
+            'turn': 0, 'intake_complete': False
+        })
+
+        collected['turn'] = collected.get('turn', 0) + 1
+        turn = collected['turn']
+
+        # Determine next field to collect (None = all done or past threshold)
+        next_field = None
+        if not collected['intake_complete'] and turn < MAX_TURNS:
+            if _fields_collected_count(collected) < INTAKE_THRESHOLD:
+                next_field = _next_missing_field(collected)
+
+        client = _get_gemini_client()
+
+        if client:
+            response_text, follow_ups, severity = await _gemini_chat(
+                client, chat_request.message, history, collected, chat_request.language,
+                next_field, turn
+            )
+        else:
+            response_text = ("I'm here to help document your symptoms. "
+                             "Please describe what you're experiencing — what symptoms do you have, "
+                             "when did they start, and how severe are they?")
+            follow_ups = ["I have a headache", "Stomach problems", "Feeling unwell"]
+            severity = None
+
+        _conversations.setdefault(user_id, []).extend([
+            {'role': 'user', 'content': chat_request.message},
+            {'role': 'assistant', 'content': response_text},
+        ])
+
         return ChatResponse(
-            response=response,
+            response=response_text,
             follow_up_questions=follow_ups,
             collected_symptoms=collected['symptoms'],
             severity_assessment=severity
         )
-        
+
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Chat failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
 
 
-async def _process_patient_message(
+async def _gemini_chat(
+    client: genai.Client,
     message: str,
     history: List[ChatMessage],
-    collected: Dict
+    collected: Dict,
+    language: str,
+    next_field: Optional[str],
+    turn: int,
 ) -> tuple[str, List[str], Optional[str]]:
-    """Process patient message and generate contextual response"""
-    
-    # Extract symptoms from message
-    symptom_keywords = {
-        'headache': 'Headache',
-        'head pain': 'Headache',
-        'migraine': 'Migraine headache',
-        'fever': 'Fever',
-        'feverish': 'Fever',
-        'temperature': 'Fever',
-        'hot': 'Fever',
-        'cough': 'Cough',
-        'coughing': 'Cough',
-        'chest pain': 'Chest pain',
-        'chest': 'Chest discomfort',
-        'stomach': 'Abdominal pain',
-        'abdominal': 'Abdominal pain',
-        'vomit': 'Vomiting',
-        'vomiting': 'Vomiting',
-        'nausea': 'Nausea',
-        'nauseous': 'Nausea',
-        'dizzy': 'Dizziness',
-        'dizziness': 'Dizziness',
-        'tired': 'Fatigue',
-        'fatigue': 'Fatigue',
-        'weak': 'Weakness',
-        'weakness': 'Weakness',
-        'pain': 'Pain',
-        'ache': 'Body ache',
-        'aching': 'Body ache',
-        'sore throat': 'Sore throat',
-        'throat': 'Sore throat',
-        'breathing': 'Breathing difficulty',
-        'breathless': 'Dyspnea',
-        'shortness of breath': 'Dyspnea',
-        'cold': 'Common cold',
-        'runny nose': 'Rhinorrhea',
-        'sneezing': 'Sneezing',
-        'chills': 'Chills',
-        'sweating': 'Sweating',
-    }
-    
-    # Extract mentioned symptoms
-    for keyword, symptom in symptom_keywords.items():
-        if keyword in message and symptom not in collected['symptoms']:
-            collected['symptoms'].append(symptom)
-    
-    # Extract duration
-    duration_patterns = ['day', 'days', 'week', 'weeks', 'hour', 'hours', 'month']
-    for pattern in duration_patterns:
-        if pattern in message:
-            # Try to extract the number
-            words = message.split()
-            for i, word in enumerate(words):
-                if word.isdigit() and i + 1 < len(words) and pattern in words[i + 1]:
-                    collected['duration'] = f"{word} {words[i + 1]}"
-                    break
-    
-    # Extract severity (1-10 scale) - improved pattern matching
-    import re
-    severity_patterns = [
-        r'(\d+)\s*(?:out of|/)\s*10',  # "8 out of 10" or "8/10"
-        r'pain\s*(?:is|level)?\s*(\d+)',  # "pain is 8" or "pain level 8"
-        r'severity\s*(?:is|:)?\s*(\d+)',  # "severity is 8" or "severity: 8"
-        r'(\d+)\s*(?:on a scale|scale)',  # "8 on a scale"
-        r'it\s*(?:is|\'s)?\s*(\d+)',  # "it is 7" or "it's 7"
-        r'(?:^|\s)(\d+)(?:\s|$|\.)',  # standalone number like "7" or "7."
-        r'discomfort\s*(?:is|:)?\s*(\d+)',  # "discomfort is 7"
-    ]
-    
-    for pattern in severity_patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
-        if match:
-            sev = int(match.group(1))
-            if 1 <= sev <= 10:
-                collected['severity'] = str(sev)
-                logger.info(f"Extracted severity {sev} from message: {message}")
-                break
-    
-    # Fallback: look for any standalone number 1-10 in short messages about rating/severity
-    if not collected['severity']:
-        # Check if recent conversation asked about severity/rating
-        recent_history = ' '.join([h.content for h in history[-2:]]) if history else ''
-        is_severity_context = any(word in recent_history.lower() for word in ['scale', 'severe', 'rate', '1-10', 'discomfort'])
-        
-        if is_severity_context or len(message.strip()) <= 15:
-            # Short response likely answering severity question
-            numbers = re.findall(r'\d+', message)
-            for num_str in numbers:
-                num = int(num_str)
-                if 1 <= num <= 10:
-                    collected['severity'] = str(num)
-                    logger.info(f"Extracted severity {num} from short message: {message}")
-                    break
-    
-    # Extract location
-    location_keywords = ['both sides', 'one side', 'left', 'right', 'front', 'back', 'all over']
-    for loc in location_keywords:
-        if loc in message:
-            collected['location'] = loc
-            break
-    
-    # Extract associated symptoms
-    associated = ['sensitive to light', 'light sensitivity', 'nausea', 'vomiting', 
-                  'blurred vision', 'stiff neck', 'fever with', 'chills']
-    for assoc in associated:
-        if assoc in message and assoc not in collected['associated_symptoms']:
-            collected['associated_symptoms'].append(assoc)
-    
-    # Determine what information is still needed
-    missing_info = []
-    if not collected['duration']:
-        missing_info.append('duration')
-    if not collected['severity']:
-        missing_info.append('severity')
-    if not collected['location'] and 'Headache' in collected['symptoms']:
-        missing_info.append('location')
-    if not collected['associated_symptoms']:
-        missing_info.append('associated_symptoms')
-    
-    # Generate contextual response based on conversation state
-    history_text = ' '.join([h.content for h in history[-4:]]) if history else ''
-    
-    # Check if we're in follow-up mode (patient already described symptoms)
-    if collected['symptoms'] and len(history) > 0:
-        # We have symptoms and previous conversation
-        return _generate_followup_response(collected, missing_info)
-    elif collected['symptoms']:
-        # First detailed description received
-        return _generate_initial_followup(collected, missing_info)
-    else:
-        # Generic greeting or unclear message
-        return _generate_clarification_response(message)
+    """Call Gemini with a stage-aware system prompt and parse the structured data block."""
 
+    # Build conversation history (cap at last 10 turns to stay within token budget)
+    contents = []
+    for msg in history[-10:]:
+        role = "user" if msg.role == "user" else "model"
+        contents.append(types.Content(role=role, parts=[types.Part(text=msg.content)]))
+    contents.append(types.Content(role="user", parts=[types.Part(text=message)]))
 
-def _generate_followup_response(collected: Dict, missing_info: List[str]) -> tuple[str, List[str], Optional[str]]:
-    """Generate follow-up response when we have some data"""
-    
-    severity = None
-    if collected['severity']:
-        sev_num = int(collected['severity'])
-        if sev_num >= 8:
-            severity = "HIGH"
-        elif sev_num >= 5:
-            severity = "MODERATE"
-        else:
-            severity = "LOW"
-    
-    # Build response summarizing what we collected
-    summary_parts = []
-    if collected['symptoms']:
-        summary_parts.append(f"symptoms: {', '.join(collected['symptoms'])}")
-    if collected['duration']:
-        summary_parts.append(f"duration: {collected['duration']}")
-    if collected['severity']:
-        summary_parts.append(f"severity: {collected['severity']}/10")
-    if collected['location']:
-        summary_parts.append(f"location: {collected['location']}")
-    if collected['associated_symptoms']:
-        summary_parts.append(f"associated: {', '.join(collected['associated_symptoms'])}")
-    
-    response = f"Thank you for providing those details. I've recorded:\n\n"
-    response += "• " + "\n• ".join(summary_parts) + "\n\n"
-    
-    follow_ups = []
-    
-    if not missing_info or len(missing_info) <= 1:
-        # We have enough info
-        response += "I have gathered enough information to prepare a summary for your doctor. "
-        
-        if severity == "HIGH":
-            response += "\n\n⚠️ **Important**: Based on the severity you described, I recommend seeking medical attention soon. "
-            if 'sensitive to light' in collected['associated_symptoms'] or 'stiff neck' in ' '.join(collected['associated_symptoms']):
-                response += "Light sensitivity and severe headache can sometimes indicate conditions requiring urgent evaluation."
-        
-        response += "\n\nIs there anything else you'd like to add before I prepare the summary?"
-        follow_ups = ["Add more symptoms", "Ready for summary", "I have a question"]
-    else:
-        # Need more info
-        if 'duration' in missing_info:
-            response += "Could you tell me how long you've been experiencing these symptoms?"
-            follow_ups.append("How long have you had this?")
-        elif 'severity' in missing_info:
-            response += "On a scale of 1-10, how severe is your discomfort?"
-            follow_ups.append("Rate your pain 1-10")
-        elif 'associated_symptoms' in missing_info:
-            response += "Are you experiencing any other symptoms along with this? (e.g., nausea, vision changes, fever)"
-            follow_ups.append("Any other symptoms?")
-    
-    return response, follow_ups, severity
+    system_prompt = _build_system_prompt(collected, turn, next_field)
 
+    try:
+        response = client.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=700,
+                temperature=0.3,   # lower = more rule-following
+            ),
+        )
+        raw = response.text or ""
+    except Exception as e:
+        logger.error("Gemini API error: %s", e)
+        raise
 
-def _generate_initial_followup(collected: Dict, missing_info: List[str]) -> tuple[str, List[str], Optional[str]]:
-    """Generate first follow-up after symptoms identified"""
-    
-    symptom_list = collected['symptoms']
-    primary_symptom = symptom_list[0] if symptom_list else "symptoms"
-    
-    response = f"I understand you're experiencing {primary_symptom.lower()}. "
-    
-    if 'Headache' in symptom_list or 'Migraine' in primary_symptom:
-        if not collected['duration']:
-            response += "To help your doctor better understand your condition, could you tell me:\n\n"
-            response += "• How long have you had this headache?\n"
-            response += "• Is the pain on one side or both sides?\n"
-            response += "• On a scale of 1-10, how severe is the pain?\n"
-            response += "• Do you have any other symptoms like nausea or sensitivity to light?"
-            follow_ups = ["Less than a day", "A few days", "More than a week"]
-        else:
-            response += f"You mentioned it's been {collected['duration']}. "
-            response += "Can you describe where exactly the pain is located and if you notice any other symptoms?"
-            follow_ups = ["One side of head", "Both sides", "Behind my eyes"]
-    elif 'Fever' in symptom_list:
-        response += "Let me ask a few questions:\n\n"
-        response += "• What is your current temperature if you've measured it?\n"
-        response += "• When did the fever start?\n"
-        response += "• Do you have any other symptoms like cough, body aches, or chills?"
-        follow_ups = ["I measured my temperature", "Started today", "Have other symptoms"]
-    elif 'Chest' in primary_symptom:
-        response += "⚠️ Chest symptoms need careful attention. Please describe:\n\n"
-        response += "• Is it a pain, pressure, or tightness?\n"
-        response += "• Does it spread to your arm, jaw, or back?\n"
-        response += "• Do you have shortness of breath?\n\n"
-        response += "**If you're experiencing severe chest pain, please seek immediate medical attention.**"
-        follow_ups = ["It's a sharp pain", "Feels like pressure", "Having trouble breathing"]
-    else:
-        response += "To help document your condition:\n\n"
-        response += "• When did these symptoms start?\n"
-        response += "• How severe are they (mild, moderate, severe)?\n"
-        response += "• Is there anything that makes them better or worse?"
-        follow_ups = ["Started recently", "It's getting worse", "Mild symptoms"]
-    
-    return response, follow_ups, None
+    # Strip the hidden <data> block from what the patient sees
+    data_match = re.search(r"<data>\s*(\{.*?\})\s*</data>", raw, re.DOTALL)
+    visible_text = re.sub(r"\s*<data>.*?</data>", "", raw, flags=re.DOTALL).strip()
 
+    follow_ups: List[str] = []
+    severity: Optional[str] = None
 
-def _generate_clarification_response(message: str) -> tuple[str, List[str], Optional[str]]:
-    """Generate response when we need more clarity"""
-    
-    if any(greeting in message for greeting in ['hello', 'hi', 'hey', 'good']):
-        response = "Hello! I'm your AI health assistant. I'm here to help gather information about your symptoms before your consultation. What brings you in today? Please describe how you're feeling."
-        follow_ups = ["I have a headache", "I'm feeling sick", "I have pain"]
-    else:
-        response = "I'm here to help document your symptoms. Could you please describe what you're experiencing? For example:\n\n"
-        response += "• What symptoms are you having?\n"
-        response += "• When did they start?\n"
-        response += "• How severe are they?"
-        follow_ups = ["I have a headache", "Stomach problems", "Feeling unwell"]
-    
-    return response, follow_ups, None
+    if data_match:
+        try:
+            parsed = json.loads(data_match.group(1))
+
+            # Merge symptoms
+            for sym in parsed.get("symptoms", []):
+                if sym and sym not in collected["symptoms"]:
+                    collected["symptoms"].append(sym)
+
+            # Merge duration
+            dur = parsed.get("duration")
+            if dur and dur != "null" and not collected["duration"]:
+                collected["duration"] = dur
+
+            # Merge severity score
+            sev_score = parsed.get("severity_score")
+            if sev_score and isinstance(sev_score, (int, float)) and not collected["severity"]:
+                collected["severity"] = str(int(sev_score))
+
+            # Merge location
+            loc = parsed.get("location")
+            if loc and loc != "null" and not collected["location"]:
+                collected["location"] = loc
+
+            # Merge associated symptoms
+            for a in parsed.get("associated", []):
+                if a and a not in collected["associated_symptoms"]:
+                    collected["associated_symptoms"].append(a)
+
+            # Merge medical history
+            for h in parsed.get("history", []):
+                if h and h not in collected["medical_history"]:
+                    collected["medical_history"].append(h)
+
+            # Severity band
+            severity = parsed.get("severity_band") or None
+            if severity in ("null", ""):
+                severity = None
+
+            # Intake complete flag
+            if parsed.get("intake_complete") is True:
+                collected["intake_complete"] = True
+
+            follow_ups = parsed.get("follow_ups", [])
+
+        except Exception as parse_err:
+            logger.warning("Could not parse data block: %s | raw: %s", parse_err, raw[:200])
+
+    # Auto-assess severity band from score if Gemini didn't provide one
+    if not severity and collected.get("severity"):
+        try:
+            s = int(collected["severity"])
+            severity = "CRITICAL" if s >= 9 else "HIGH" if s >= 7 else "MODERATE" if s >= 4 else "LOW"
+        except ValueError:
+            pass
+
+    return visible_text, follow_ups, severity
+
 
 
 @router.post("/", response_model=PatientResponse, status_code=status.HTTP_201_CREATED)
