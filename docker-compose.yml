@@ -14,19 +14,17 @@ services:
       - DATABASE_URL=postgresql+asyncpg://nidaan:nidaan123@postgres:5432/nidaan
       - REDIS_URL=redis://redis:6379
       - JWT_SECRET=dev-secret-change-in-production
-      # Gemini — set your key here or in .env
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_MODEL=gemini-1.5-flash
-      # Cloudflare R2 — optional for local dev
-      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID:-}
-      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
-      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
-      - R2_BUCKET_NAME=nidaan-audio-storage
+      # Gemini
+      - GEMINI_API_KEY=AIzaSyD3Zu4TB4gSgPBHC8VK0xZLovOVYFOD39I
+      - GEMINI_MODEL=gemini-2.0-flash
+      # Local file storage
+      - STORAGE_PATH=/app/uploads
       # Email
-      - SMTP_EMAIL=${SMTP_EMAIL:-}
+      - SMTP_EMAIL=${SMTP_EMAIL:-venkatesh.k21062005@gmail.com}
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
     volumes:
       - ./apps/api:/app
+      - uploads-data:/app/uploads
     depends_on:
       - postgres
       - redis
@@ -78,3 +76,4 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  uploads-data:

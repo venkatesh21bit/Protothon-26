@@ -26,18 +26,13 @@ class Settings(BaseSettings):
 
     # ==================== Google Gemini (LLM + STT + NLU) ====================
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-1.5-flash"
+    GEMINI_MODEL: str = "gemini-2.0-flash"
 
     # ==================== PostgreSQL Database ====================
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/nidaan"
 
-    # ==================== Cloudflare R2 Storage (S3-compatible) ====================
-    R2_ACCOUNT_ID: Optional[str] = None
-    R2_ACCESS_KEY_ID: Optional[str] = None
-    R2_SECRET_ACCESS_KEY: Optional[str] = None
-    R2_BUCKET_NAME: str = "nidaan-audio-storage"
-    # Derived endpoint — override via env if needed
-    R2_ENDPOINT_URL: Optional[str] = None  # e.g. https://<account_id>.r2.cloudflarestorage.com
+    # ==================== Local File Storage ====================
+    STORAGE_PATH: str = "./uploads"  # Local directory for uploaded audio files
 
     # ==================== Email Configuration (SMTP) ====================
     # Using Gmail SMTP for patient outreach

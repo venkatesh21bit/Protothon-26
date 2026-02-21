@@ -1,9 +1,12 @@
 """
 Storage Service
-Handles S3 operations for audio file storage
+Handles local filesystem storage for audio files (no cloud credentials required).
+Falls back to in-memory storage if the upload directory cannot be created.
 """
-import boto3
-from botocore.exceptions import ClientError
+import os
+import uuid
+import shutil
+from pathlib import Path
 from typing import Optional, Dict
 import logging
 from app.core.config import settings
@@ -12,180 +15,101 @@ from app.core.exceptions import StorageException
 logger = logging.getLogger(__name__)
 
 
-class S3StorageService:
-    """Storage service backed by Cloudflare R2 (S3-compatible API)."""
+class LocalFileStorageService:
+    """Storage service backed by the local filesystem.
+    
+    Stores uploaded audio inside STORAGE_PATH (default ./uploads).
+    Works for local dev and Railway (mount a persistent volume at STORAGE_PATH).
+    """
 
     def __init__(self):
-        """Initialize Cloudflare R2 client using boto3 S3-compatible API."""
-        # Derive endpoint from account ID if not explicitly set
-        endpoint = settings.R2_ENDPOINT_URL or (
-            f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-            if settings.R2_ACCOUNT_ID
-            else None
-        )
+        self.base_path = Path(settings.STORAGE_PATH).resolve()
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Local file storage initialised at {self.base_path}")
 
-        client_config = {
-            "region_name": "auto",  # R2 uses 'auto' as the region
-        }
-        if endpoint:
-            client_config["endpoint_url"] = endpoint
-        if settings.R2_ACCESS_KEY_ID:
-            client_config["aws_access_key_id"] = settings.R2_ACCESS_KEY_ID
-            client_config["aws_secret_access_key"] = settings.R2_SECRET_ACCESS_KEY
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _full_path(self, object_key: str) -> Path:
+        p = self.base_path / object_key
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
 
-        self.s3_client = boto3.client("s3", **client_config)
-        self.bucket_name = settings.R2_BUCKET_NAME
-
-        # Ensure bucket exists (best-effort)
-        self._ensure_bucket_exists()
-    
-    def _ensure_bucket_exists(self):
-        """Create bucket if it doesn't exist (non-fatal)."""
-        try:
-            self.s3_client.head_bucket(Bucket=self.bucket_name)
-            logger.info(f"R2 bucket '{self.bucket_name}' exists")
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code in ("404", "NoSuchBucket"):
-                try:
-                    self.s3_client.create_bucket(Bucket=self.bucket_name)
-                    logger.info(f"Created R2 bucket '{self.bucket_name}'")
-                except Exception as create_error:
-                    logger.warning(f"Could not create R2 bucket: {create_error}")
-            else:
-                logger.warning(f"R2 head_bucket error (ignored): {e}")
-    
+    # ------------------------------------------------------------------
+    # Public interface (mirrors the old S3StorageService API)
+    # ------------------------------------------------------------------
     def generate_presigned_url(
         self,
         object_key: str,
         expiration: int = None,
-        operation: str = 'put_object'
+        operation: str = "put_object",
     ) -> str:
-        """
-        Generate a presigned URL for uploading or downloading audio files
-        
-        Args:
-            object_key: S3 object key (path)
-            expiration: URL expiration time in seconds
-            operation: 'put_object' for upload, 'get_object' for download
-            
-        Returns:
-            Presigned URL string
-        """
+        """Return a local upload marker (no real presigned URL needed for local storage)."""
+        return f"LOCAL_UPLOAD:{object_key}"
+
+    def generate_presigned_upload_url(
+        self, patient_id: str, visit_id: str, file_extension: str = "webm"
+    ) -> Dict[str, str]:
+        object_key = f"audio/{patient_id}/{visit_id}/{uuid.uuid4()}.{file_extension}"
+        return {"upload_url": f"LOCAL_UPLOAD:{object_key}", "object_key": object_key}
+
+    def generate_presigned_download_url(
+        self, object_key: str, expiration: int = None
+    ) -> str:
+        return f"LOCAL_DOWNLOAD:{object_key}"
+
+    def upload_file(
+        self, file_obj, object_key: str, content_type: str = "audio/webm"
+    ) -> str:
         try:
-            expiration = expiration or 600  # 10 minutes default
-            
-            url = self.s3_client.generate_presigned_url(
-                ClientMethod=operation,
-                Params={
-                    'Bucket': self.bucket_name,
-                    'Key': object_key
-                },
-                ExpiresIn=expiration
-            )
-            
-            logger.info(f"Generated presigned URL for {object_key}")
-            return url
-            
-        except ClientError as e:
-            logger.error(f"Error generating presigned URL: {str(e)}")
-            raise StorageException(
-                message="Failed to generate upload URL",
-                details={"object_key": object_key, "error": str(e)}
-            )
-    
-    def upload_file(self, file_obj, object_key: str, content_type: str = 'audio/webm') -> str:
-        """
-        Upload a file to S3
-        
-        Args:
-            file_obj: File object to upload
-            object_key: S3 object key
-            content_type: MIME type of the file
-            
-        Returns:
-            S3 object key
-        """
-        try:
-            self.s3_client.upload_fileobj(
-                file_obj,
-                self.bucket_name,
-                object_key,
-                ExtraArgs={
-                    'ContentType': content_type,
-                    'ServerSideEncryption': 'AES256'
-                }
-            )
-            
-            logger.info(f"Uploaded file to {object_key}")
+            dest = self._full_path(object_key)
+            with open(dest, "wb") as f:
+                shutil.copyfileobj(file_obj, f)
+            logger.info(f"Saved file locally: {dest}")
             return object_key
-            
-        except ClientError as e:
-            logger.error(f"Error uploading file: {str(e)}")
+        except Exception as e:
             raise StorageException(
-                message="Failed to upload audio file",
-                details={"object_key": object_key, "error": str(e)}
+                message="Failed to save audio file locally",
+                details={"object_key": object_key, "error": str(e)},
             )
-    
+
+    async def upload_audio(
+        self,
+        file_data: bytes,
+        patient_id: str,
+        visit_id: str,
+        file_extension: str = "webm",
+    ) -> str:
+        object_key = f"audio/{patient_id}/{visit_id}/{uuid.uuid4()}.{file_extension}"
+        dest = self._full_path(object_key)
+        dest.write_bytes(file_data)
+        logger.info(f"Saved audio locally: {dest} ({len(file_data)} bytes)")
+        return object_key
+
     def download_file(self, object_key: str) -> bytes:
-        """
-        Download a file from S3
-        
-        Args:
-            object_key: S3 object key
-            
-        Returns:
-            File contents as bytes
-        """
-        try:
-            response = self.s3_client.get_object(
-                Bucket=self.bucket_name,
-                Key=object_key
-            )
-            
-            return response['Body'].read()
-            
-        except ClientError as e:
-            logger.error(f"Error downloading file: {str(e)}")
+        dest = self._full_path(object_key)
+        if not dest.exists():
             raise StorageException(
-                message="Failed to download audio file",
-                details={"object_key": object_key, "error": str(e)}
+                message="File not found", details={"object_key": object_key}
             )
-    
+        return dest.read_bytes()
+
+    async def download_audio(self, object_key: str) -> bytes:
+        return self.download_file(object_key)
+
     def delete_file(self, object_key: str) -> bool:
-        """
-        Delete a file from S3
-        
-        Args:
-            object_key: S3 object key
-            
-        Returns:
-            True if successful
-        """
-        try:
-            self.s3_client.delete_object(
-                Bucket=self.bucket_name,
-                Key=object_key
-            )
-            
-            logger.info(f"Deleted file {object_key}")
+        dest = self._full_path(object_key)
+        if dest.exists():
+            dest.unlink()
+            logger.info(f"Deleted local file: {dest}")
             return True
-            
-        except ClientError as e:
-            logger.error(f"Error deleting file: {str(e)}")
-            raise StorageException(
-                message="Failed to delete audio file",
-                details={"object_key": object_key, "error": str(e)}
-            )
-    
+        return False
+
+    async def delete_audio(self, object_key: str) -> bool:
+        return self.delete_file(object_key)
+
     def get_file_url(self, object_key: str) -> str:
-        """Get public R2 URL (only works if bucket has public access enabled)."""
-        endpoint = settings.R2_ENDPOINT_URL or (
-            f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-            if settings.R2_ACCOUNT_ID
-            else "https://r2.cloudflarestorage.com"
-        )
-        return f"{endpoint}/{self.bucket_name}/{object_key}"
+        return f"LOCAL_FILE:{object_key}"
 
 
 class InMemoryStorageService:
@@ -244,7 +168,7 @@ class InMemoryStorageService:
 
 
 # Union type for both storage services
-StorageService = S3StorageService | InMemoryStorageService
+StorageService = LocalFileStorageService | InMemoryStorageService
 
 # Lazy-initialized global instance
 _storage_service: Optional[StorageService] = None
@@ -254,9 +178,9 @@ def get_storage_service() -> StorageService:
     global _storage_service
     if _storage_service is None:
         try:
-            _storage_service = S3StorageService()
+            _storage_service = LocalFileStorageService()
         except Exception as e:
-            logger.warning(f"Could not connect to S3: {e}. Using in-memory storage.")
+            logger.warning(f"Could not init local storage: {e}. Using in-memory storage.")
             _storage_service = InMemoryStorageService()
     return _storage_service
 
@@ -264,13 +188,13 @@ def get_storage_service() -> StorageService:
 class LazyStorageService:
     """Lazy wrapper that defers service creation until first use"""
     _instance: Optional[StorageService] = None
-    
+
     def __getattr__(self, name):
         if LazyStorageService._instance is None:
             try:
-                LazyStorageService._instance = S3StorageService()
+                LazyStorageService._instance = LocalFileStorageService()
             except Exception as e:
-                logger.warning(f"Could not connect to S3: {e}. Using in-memory storage.")
+                logger.warning(f"Could not init local storage: {e}. Using in-memory storage.")
                 LazyStorageService._instance = InMemoryStorageService()
         return getattr(LazyStorageService._instance, name)
 
