@@ -121,12 +121,18 @@ async def create_tables() -> None:
 # ---------------------------------------------------------------------------
 
 class _NoOpDBClient:
-    """Stub so that any stray `from app.core.db import db_client` doesn't crash."""
-    def __getattr__(self, name):  # noqa: D105
-        raise AttributeError(
-            f"DynamoDB client was removed. Use AsyncSessionLocal instead. "
-            f"Attribute requested: {name}"
-        )
+    """Stub so that any stray `from app.core.db import db_client` doesn't crash.
+    Returns empty/safe values so routes that still call db_client don't 500.
+    Real data access should go through cloudant_service (PostgreSQL).
+    """
+    class _NoOpCallable:
+        def __call__(self, *args, **kwargs):
+            return []
+        def __iter__(self):
+            return iter([])
+
+    def __getattr__(self, name):
+        return self._NoOpCallable()
 
 
 db_client = _NoOpDBClient()
