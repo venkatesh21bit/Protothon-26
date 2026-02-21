@@ -16,7 +16,7 @@ services:
       - JWT_SECRET=dev-secret-change-in-production
       # Gemini
       - GEMINI_API_KEY=AIzaSyD3Zu4TB4gSgPBHC8VK0xZLovOVYFOD39I
-      - GEMINI_MODEL=gemini-2.0-flash
+      - GEMINI_MODEL=gemini-3-flash-preview
       # Local file storage
       - STORAGE_PATH=/app/uploads
       # Email

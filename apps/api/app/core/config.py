@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # ==================== Google Gemini (LLM + STT + NLU) ====================
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-2.0-flash"
+    GEMINI_MODEL: str = "gemini-3-flash-preview"
 
     # ==================== PostgreSQL Database ====================
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/nidaan"

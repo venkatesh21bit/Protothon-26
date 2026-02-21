@@ -1,6 +1,6 @@
 ﻿"""
-Speech-to-Text Service (Google Gemini)
-Transcribes patient audio recordings using Gemini 1.5 Flash.
+Speech-to-Text Service (Google Gemini 3 Flash)
+Transcribes patient audio recordings using the new google-genai SDK.
 Supports Indian languages: Hindi, Tamil, Telugu, Marathi, Bengali, English.
 """
 import logging
@@ -8,7 +8,8 @@ import os
 import tempfile
 from typing import Any, Dict, Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from app.core.config import settings
 
@@ -45,7 +46,7 @@ class IBMSpeechToText:
 
     def __init__(self) -> None:
         self._initialized = False
-        self._model: Optional[genai.GenerativeModel] = None
+        self._client: Optional[genai.Client] = None
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -54,10 +55,9 @@ class IBMSpeechToText:
             logger.warning("GEMINI_API_KEY not set — STT running in mock mode")
             self._initialized = True
             return
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        self._model = genai.GenerativeModel(settings.GEMINI_MODEL)
+        self._client = genai.Client(api_key=settings.GEMINI_API_KEY)
         self._initialized = True
-        logger.info("Gemini Speech-to-Text initialized")
+        logger.info("Gemini Speech-to-Text initialized (model: %s)", settings.GEMINI_MODEL)
 
     async def transcribe_audio(
         self,
@@ -72,7 +72,7 @@ class IBMSpeechToText:
 
         language_name = LANGUAGE_NAMES.get(language, "English")
 
-        if not self._model:
+        if not self._client:
             return self._mock_response(language_name)
 
         tmp_path: Optional[str] = None
@@ -83,14 +83,20 @@ class IBMSpeechToText:
                 tmp.write(audio_data)
                 tmp_path = tmp.name
 
-            uploaded_file = genai.upload_file(tmp_path, mime_type=content_type)
+            uploaded_file = self._client.files.upload(
+                file=tmp_path,
+                config=types.UploadFileConfig(mime_type=content_type),
+            )
 
             prompt = (
                 f"Transcribe the following audio recording. "
                 f"The patient is speaking in {language_name}. "
                 f"Return ONLY the transcript text — no labels, no commentary."
             )
-            response = self._model.generate_content([prompt, uploaded_file])
+            response = self._client.models.generate_content(
+                model=settings.GEMINI_MODEL,
+                contents=[prompt, uploaded_file],
+            )
             transcript = response.text.strip()
 
             logger.info("Transcription complete. Language: %s, Length: %d", language_name, len(transcript))
@@ -118,7 +124,7 @@ class IBMSpeechToText:
                 os.unlink(tmp_path)
             if uploaded_file:
                 try:
-                    genai.delete_file(uploaded_file.name)
+                    self._client.files.delete(name=uploaded_file.name)
                 except Exception:
                     pass
 

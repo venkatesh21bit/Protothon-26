@@ -1,12 +1,13 @@
 """
 LLM Chain - RAG Pipeline for Clinical Documentation
-Powered by Google Gemini 1.5 Flash (replaces AWS Bedrock/Claude)
+Powered by Google Gemini 3 Flash (new google-genai SDK)
 """
 import json
 import logging
 from typing import Dict, List, Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from app.core.config import settings
 from app.core.exceptions import LLMException
@@ -26,12 +27,11 @@ class MedicalRAGChain:
     def __init__(self):
         """Initialize Gemini client"""
         if settings.GEMINI_API_KEY:
-            genai.configure(api_key=settings.GEMINI_API_KEY)
-            self._gemini = genai.GenerativeModel(settings.GEMINI_MODEL)
+            self._client = genai.Client(api_key=settings.GEMINI_API_KEY)
             self.mock_mode = False
             logger.info("MedicalRAGChain initialized with Gemini %s", settings.GEMINI_MODEL)
         else:
-            self._gemini = None
+            self._client = None
             self.mock_mode = True
             logger.info("MedicalRAGChain initialized in mock mode (no GEMINI_API_KEY)")
     
@@ -179,19 +179,20 @@ class MedicalRAGChain:
     
     async def _invoke_gemini(self, prompt: str, max_tokens: int = 1024) -> str:
         """
-        Invoke Google Gemini 1.5 Flash.
+        Invoke Google Gemini 3 Flash via the new google-genai Client API.
 
         Args:
             prompt: Prompt text
-            max_tokens: Maximum response tokens (passed as generation config)
+            max_tokens: Maximum response tokens
 
         Returns:
             Model response text
         """
         try:
-            response = self._gemini.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
+            response = self._client.models.generate_content(
+                model=settings.GEMINI_MODEL,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
                     max_output_tokens=max_tokens,
                     temperature=0.3,
                     top_p=0.9,

@@ -1,14 +1,14 @@
 """
-NLU Processor (Google Gemini)
+NLU Processor (Google Gemini 3 Flash)
 Extracts medical entities, symptoms, medications, and sentiment from
-unstructured patient text using Gemini 1.5 Flash structured output.
+unstructured patient text using the new google-genai SDK.
 """
 import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-import google.generativeai as genai
+from google import genai
 
 from app.core.config import settings
 
@@ -39,7 +39,7 @@ class NLUProcessor:
 
     def __init__(self) -> None:
         self._initialized = False
-        self._model: Optional[genai.GenerativeModel] = None
+        self._client: Optional[genai.Client] = None
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -48,10 +48,9 @@ class NLUProcessor:
             logger.warning("GEMINI_API_KEY not set — NLU running in fallback keyword mode")
             self._initialized = True
             return
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        self._model = genai.GenerativeModel(settings.GEMINI_MODEL)
+        self._client = genai.Client(api_key=settings.GEMINI_API_KEY)
         self._initialized = True
-        logger.info("Gemini NLU initialized")
+        logger.info("Gemini NLU initialized (model: %s)", settings.GEMINI_MODEL)
 
     # ------------------------------------------------------------------
     # Main entry points used by triage_engine.py
@@ -94,7 +93,7 @@ class NLUProcessor:
         if not self._initialized:
             await self.initialize()
 
-        if not self._model:
+        if not self._client:
             return self._fallback_extraction(text)
 
         prompt = f"""You are a medical NLU system. Analyze the following patient text and extract structured medical information.
@@ -117,7 +116,10 @@ Return a JSON object with exactly these keys:
 Return ONLY valid JSON. No explanation."""
 
         try:
-            response = self._model.generate_content(prompt)
+            response = self._client.models.generate_content(
+                model=settings.GEMINI_MODEL,
+                contents=[prompt],
+            )
             raw = response.text.strip()
             # Strip markdown code fences if present
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
